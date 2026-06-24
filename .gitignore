@@ -1,4 +1,47 @@
-# nacOS stuff
+# macOS
 .DS_Store
-reactome_genes
-casei_atcc334
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Local/generated inputs and outputs
+reactome_genes/
+casei_atcc334/
+*_dir/
+temp_files/
+initial_models_dir/
+output_models_dir/
+present_absence_dir/
+bbh_dir/
+nucls_dir/
+prots_dir/
+
+# Generated strain work directories
+Onc_A1/
+Onc_A8/
+Yak_3/
+acidophilus_NCFM/
+bulgaricus_11842/
+casei_BL23/
+plantarum_wcfs1/
+rhamnosus_53103/
+thermophilus_18311/
+
+# BLAST/database index files
+*.nhr
+*.nin
+*.njs
+*.not
+*.nsq
+*.ntf
+*.nto
+*.ndb
+*.phr
+*.pin
+*.pjs
+*.pot
+*.psq
+*.ptf
+*.pto
+*.pdb

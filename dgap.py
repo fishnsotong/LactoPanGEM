@@ -11,6 +11,7 @@ Created on Mon Aug 15 09:27:09 2022
 #imports
 
 
+import argparse
 import cobra
 import pandas as pd
 from cobra.io import load_json_model
@@ -21,13 +22,49 @@ from cobra import Model, Reaction, Metabolite
 import multiprocessing as mp
 import numpy as np
 import os
+from functools import partial
+from pathlib import Path
+
+
+LEGACY_GAP_DIR = '/home/omidard/allgems/Limosilactobacillus_fermentum/biomassed'
+LEGACY_TEMPLATE = 'GCF_009556455.1.json'
+
+
+def resolve_model_file(model_ref, models_dir=None):
+    candidate = Path(model_ref)
+    if candidate.is_file():
+        return str(candidate)
+
+    if models_dir is None:
+        raise FileNotFoundError(f"Could not resolve model path for {model_ref}")
+
+    base = Path(models_dir)
+    guesses = [
+        base / model_ref,
+        base / f"{model_ref}.json",
+    ]
+    for guess in guesses:
+        if guess.is_file():
+            return str(guess)
+
+    matches = list(base.glob(f"{model_ref}*.json"))
+    if len(matches) == 1:
+        return str(matches[0])
+
+    raise FileNotFoundError(f"Could not resolve model path for {model_ref} in {models_dir}")
+
+
+def ensure_dir(path):
+    Path(path).mkdir(parents=True, exist_ok=True)
+    return path
 
 
 
 
 #formulation of a chemically defined media
-def m9(model):
-    model.solver = 'gurobi'
+def m9(model, solver=None):
+    if solver:
+        model.solver = solver
     for reaction in model.reactions:
         if 'EX_' in  reaction.id:
             reaction.lower_bound=0
@@ -124,7 +161,7 @@ def m9(model):
 
 
 #scanning models and retrive important information
-def scan(directory):
+def scan(directory, solver=None, growth_threshold=0.01):
     models =glob('%s/*.json'%directory)
     gr=[]
     mid=[]
@@ -134,11 +171,12 @@ def scan(directory):
     temps=[] #gapfilled mopdels
     for mod in models:
         model=load_json_model(mod)
-        m9(model)
+        m9(model, solver=solver)
         fba=model.optimize()
-        failed.append(model.id)
-        if fba.fluxes.BIOMASS2 >= 0.01:
+        if fba.fluxes.BIOMASS2 >= growth_threshold:
             temps.append(model.id)
+        else:
+            failed.append(model.id)
         gr.append(fba.fluxes.BIOMASS2)
         mid.append(model.id)
         reactions_gap.append(len(model.genes.GAP.reactions))
@@ -170,16 +208,17 @@ def tempfind(all_gems,failed,temps):
 
 
 #find candidate reactions
-def gaps(failed,temp_name):
+def gaps(failed,temp_name, models_dir=LEGACY_GAP_DIR, template_path=None):
     temp_re_id=[] #list1
-    dir2='/home/omidard/allgems/Limosilactobacillus_fermentum/biomassed'
-    template = load_json_model(dir2+'/'+temp_name)
+    if template_path is None:
+        template_path = resolve_model_file(temp_name, models_dir)
+    template = load_json_model(template_path)
     for reaction in template.reactions:
         temp_re_id.append(reaction.id)
     allmissing=[]
     for i in failed:
         missing=pd.DataFrame()
-        model = load_json_model(dir2+'/'+i)
+        model = load_json_model(resolve_model_file(i, models_dir))
         failed_re_id=[] #list two
         for reaction in model.reactions:
             failed_re_id.append(reaction.id)
@@ -206,13 +245,29 @@ def zx(allmissing):
 
 
 #add candidate reactions and save models based on gapfilling status
-def addgaps(allgapz,modelsz,temp_name):
+def addgaps(
+    allgapz,
+    modelsz,
+    temp_name,
+    models_dir=LEGACY_GAP_DIR,
+    feasible_dir=None,
+    failed_dir=None,
+    template_path=None,
+    solver=None,
+    growth_threshold=0.01,
+):
+    if feasible_dir is None:
+        feasible_dir = os.path.join(models_dir, 'feasible')
+    if failed_dir is None:
+        failed_dir = os.path.join(models_dir, 'failed2')
+    ensure_dir(feasible_dir)
+    ensure_dir(failed_dir)
+    if template_path is None:
+        template_path = resolve_model_file(temp_name, models_dir)
+
     for i in range(len(modelsz)):
-        dir2='/home/omidard/allgems/Limosilactobacillus_fermentum/biomassed'
-        dir3='/home/omidard/allgems/Limosilactobacillus_fermentum/feasible/'
-        dir4='/home/omidard/allgems/Limosilactobacillus_fermentum/failed2/'
-        model = load_json_model(dir2+'/'+modelsz[i])
-        template = load_json_model(dir2+'/'+temp_name)
+        model = load_json_model(resolve_model_file(modelsz[i], models_dir))
+        template = load_json_model(template_path)
         for x in allgapz[i]:
             if x != 'no':
                 reaction = template.reactions.get_by_id(x)
@@ -227,23 +282,25 @@ def addgaps(allgapz,modelsz,temp_name):
                 model.repair()
                 print(reaction2.id)
                 print('-----done')
-                m9(model)
+                m9(model, solver=solver)
                 print(model.optimize().fluxes.BIOMASS2)
-            if model.optimize().fluxes.BIOMASS2>0.01:
-                cobra.io.json.save_json_model(model,dir3+model.id)
-            if model.optimize().fluxes.BIOMASS2<=0.01:
-                cobra.io.json.save_json_model(model,dir4+model.id)
+        m9(model, solver=solver)
+        out_path = os.path.join(
+            feasible_dir if model.optimize().fluxes.BIOMASS2 > growth_threshold else failed_dir,
+            f"{Path(model.id).stem}.json",
+        )
+        cobra.io.json.save_json_model(model, out_path)
 
 
 
-def fluxanalyze (rea):
-    dir2='/home/omidard/allgems/Limosilactobacillus_fermentum/biomassed'
-    temp_name = 'GCF_009556455.1.json'
-    template = load_json_model(dir2+'/'+temp_name)
-    m9(template)
+def fluxanalyze(rea, template_path=None, solver=None, growth_threshold=0.1):
+    if template_path is None:
+        template_path = resolve_model_file(LEGACY_TEMPLATE, LEGACY_GAP_DIR)
+    template = load_json_model(template_path)
+    m9(template, solver=solver)
     template.reactions.get_by_id(rea).lower_bound = 0
     template.reactions.get_by_id(rea).upper_bound = 0
-    if template.optimize().fluxes.BIOMASS2 < 0.1:
+    if template.optimize().fluxes.BIOMASS2 < growth_threshold:
         tar = rea
     else:
         tar = 'no'
@@ -730,52 +787,113 @@ def pro_ess_eff(df):
         flxc.append(flx)
     df[df.columns[0]] = flxc
     return df
-        
-        
-        
-    
-        
-            
-    
-    
-    
-            
-    
-        
-    
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-    
-    
 
 
+def pick_template(models_dir, template_path, solver=None, growth_threshold=0.01):
+    scan_df, failed, temps = scan(models_dir, solver=solver, growth_threshold=growth_threshold)
+    if template_path:
+        resolved_template = resolve_model_file(template_path, models_dir)
+        template_id = Path(resolved_template).stem
+        temps_inf = tempfind(scan_df, failed, temps)
+    else:
+        if not temps:
+            raise ValueError("No feasible models found to use as a gapfilling template.")
+        temps_inf = tempfind(scan_df, failed, temps)
+        template_id = temps_inf.iloc[0]["id"]
+        resolved_template = resolve_model_file(template_id, models_dir)
+    return scan_df, failed, temps_inf, template_id, resolved_template
 
 
+def run_gapfill_pipeline(models_dir, out_dir, template_path=None, solver=None, threads=None, growth_threshold=0.01):
+    models_dir = str(Path(models_dir))
+    out_dir = str(Path(out_dir))
+    ensure_dir(out_dir)
+    feasible_dir = ensure_dir(os.path.join(out_dir, "feasible"))
+    failed_dir = ensure_dir(os.path.join(out_dir, "failed"))
+
+    scan_df, failed, temps_inf, template_id, resolved_template = pick_template(
+        models_dir,
+        template_path,
+        solver=solver,
+        growth_threshold=growth_threshold,
+    )
+    scan_df.to_csv(os.path.join(out_dir, "scan_summary.csv"), index=False)
+    temps_inf.to_csv(os.path.join(out_dir, "template_candidates.csv"), index=False)
+
+    if not failed:
+        print("No failed models detected; nothing to gapfill.")
+        return {
+            "scan": scan_df,
+            "failed": failed,
+            "template_candidates": temps_inf,
+            "template_id": template_id,
+            "template_path": resolved_template,
+        }
+
+    allmissing = gaps(failed, template_id, models_dir=models_dir, template_path=resolved_template)
+    xlist, modelsz = zx(allmissing)
+
+    worker_count = threads or mp.cpu_count()
+    allgapz = []
+    with mp.Pool(worker_count) as pool:
+        for reactions in xlist:
+            allgapz.append(
+                pool.map(
+                    partial(fluxanalyze, template_path=resolved_template, solver=solver, growth_threshold=0.1),
+                    reactions,
+                )
+            )
+
+    selected_rows = []
+    for model_id, gaps_for_model in zip(modelsz, allgapz):
+        for reaction_id in gaps_for_model:
+            if reaction_id != "no":
+                selected_rows.append({"model_id": model_id, "reaction_id": reaction_id})
+    pd.DataFrame(selected_rows).to_csv(os.path.join(out_dir, "selected_gap_reactions.csv"), index=False)
+
+    addgaps(
+        allgapz,
+        modelsz,
+        template_id,
+        models_dir=models_dir,
+        feasible_dir=feasible_dir,
+        failed_dir=failed_dir,
+        template_path=resolved_template,
+        solver=solver,
+        growth_threshold=growth_threshold,
+    )
+
+    return {
+        "scan": scan_df,
+        "failed": failed,
+        "template_candidates": temps_inf,
+        "template_id": template_id,
+        "template_path": resolved_template,
+    }
 
 
+def main():
+    parser = argparse.ArgumentParser(description="Gapfill draft GEMs against a feasible template model.")
+    parser.add_argument("--models", required=True, help="Directory containing input draft GEM JSON files.")
+    parser.add_argument("--out", required=True, help="Output directory for gapfilled results and reports.")
+    parser.add_argument("--template", default=None, help="Optional template model path or id. Defaults to the largest feasible model.")
+    parser.add_argument("--solver", default=None, help="Optional cobra solver name, for example gurobi or glpk.")
+    parser.add_argument("--threads", type=int, default=None, help="Worker processes for reaction screening.")
+    parser.add_argument("--growth-threshold", type=float, default=0.01, help="Minimum BIOMASS2 flux for a model to count as feasible.")
+    args = parser.parse_args()
 
+    results = run_gapfill_pipeline(
+        models_dir=args.models,
+        out_dir=args.out,
+        template_path=args.template,
+        solver=args.solver,
+        threads=args.threads,
+        growth_threshold=args.growth_threshold,
+    )
+    print(f"Template model: {results['template_id']}")
+    print(f"Template path: {results['template_path']}")
+    print(f"Failed models processed: {len(results['failed'])}")
+
+
+if __name__ == "__main__":
+    main()

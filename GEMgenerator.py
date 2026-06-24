@@ -28,6 +28,8 @@ Key inputs (defaults shown):
     --threads    16                        (BLAST threads)
 """
 import argparse
+import io  # PATCH: in-memory handle for normalized GenBank text
+import re  # PATCH: detect wrapped LOCUS date lines
 import cobra
 import pandas as pd
 from cobra.io import load_json_model
@@ -35,14 +37,57 @@ from glob import glob
 from cobra.manipulation.delete import delete_model_genes, remove_genes
 import os
 from os.path import join
+from pathlib import Path
 import pandas as pd
 from glob import glob
 from Bio import Entrez, SeqIO
+from Bio.Seq import Seq
 from os.path import join
 from os.path import isfile, join
 from os import listdir
 import shutil
 import numpy as np
+
+
+# PATCH: Some GenBank exports wrap long LOCUS lines and place the date on the
+# PATCH: next line. When that happens, long NODE_* contig names can also absorb
+# PATCH: the sequence length into the locus token itself. Biopython rejects that
+# PATCH: malformed header, so normalize it before calling SeqIO.read/parse.
+PATCH_LOCUS_DATE_RE = re.compile(r"^\d{2}-[A-Z]{3}-\d{4}$")
+
+
+def open_patched_genbank_handle(path):
+    # PATCH: Rebuild wrapped LOCUS headers into a Biopython-accepted layout.
+    with open(path, "r") as source:
+        lines = source.readlines()
+
+    normalized_lines = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        next_line = lines[i + 1].strip() if i + 1 < len(lines) else None
+        if (
+            line.startswith("LOCUS")
+            and next_line
+            and PATCH_LOCUS_DATE_RE.fullmatch(next_line)
+            and not PATCH_LOCUS_DATE_RE.search(line.rstrip())
+        ):
+            raw_locus = line.split()[1]
+            size_match = re.search(r"_length_(\d+)", raw_locus)
+            if size_match:
+                size = size_match.group(1)
+                locus = raw_locus[:-len(size)] if raw_locus.endswith(size) else raw_locus
+                normalized_lines.append(
+                    f"LOCUS       {locus} {size} bp DNA UNK {next_line}\n"
+                )
+            else:
+                normalized_lines.append(f"{line.rstrip()}       {next_line}\n")
+            i += 2
+            continue
+        normalized_lines.append(line)
+        i += 1
+
+    return io.StringIO("".join(normalized_lines))
 
 
 
@@ -83,7 +128,7 @@ def get_strain_info(directory1):
     strain_info = []
     
     for file in files:
-        handle = open(file)
+        handle = open_patched_genbank_handle(file)  # PATCH: normalize wrapped LOCUS headers
         record = SeqIO.read(handle, "genbank")
         for f in record.features:
             if f.type=='source':
@@ -118,7 +163,7 @@ def parse_genome(id, type='prot', in_folder='genomes', out_folder='prots', overw
     else:
         print ('parsing %s'%id)
     
-    handle = open(in_file)
+    handle = open_patched_genbank_handle(in_file)  # PATCH: normalize wrapped LOCUS headers
     
     fout = open(out_file,'w')
     x = 0
@@ -147,17 +192,20 @@ def parse_genome(id, type='prot', in_folder='genomes', out_folder='prots', overw
 
 def make_blast_db(id,folder='prots',db_type='prot'):
     import os
-    
-    out_file ='%s/%s.fa.pin'%(folder, id)
-    files =glob('%s/*.fa.pin'%folder)
-    
-    if out_file in files:
-        print (id, 'already has a blast db')
-        return
+
     if db_type=='nucl':
+        # 24/03: nucleotide BLAST databases produce .fna.* index files, not .fa.* ones.
         ext='fna'
+        marker = '%s/%s.%s.nin' % (folder, id, ext)
+        files = glob('%s/*.fna.nin' % folder)
     else:
         ext='fa'
+        marker ='%s/%s.%s.pin'%(folder, id, ext)
+        files =glob('%s/*.fa.pin'%folder)
+
+    if marker in files:
+        print (id, 'already has a blast db')
+        return
 
     cmd_line="makeblastdb -in %s/%s.%s -dbtype %s" %(folder, id, ext, db_type)
     
@@ -245,7 +293,7 @@ def get_bbh(query, subject, in_folder='bbh', prots_dir='prots_dir', threads=64):
 
 def gbk2fasta(gbk_filename):
     faa_filename = '.'.join(gbk_filename.split('.')[:-1])+'.fna'
-    input_handle  = open(gbk_filename, "r")
+    input_handle  = open_patched_genbank_handle(gbk_filename)  # PATCH: normalize wrapped LOCUS headers
     output_handle = open(faa_filename, "w")
 
     for seq_record in SeqIO.parse(input_handle, "genbank") :
@@ -289,17 +337,37 @@ def extract_seq(g, contig, start, end):
     records = SeqIO.parse(handle, "fasta")
     
     seq = None
+    start = int(start)
+    end = int(end)
     for record in records:
         if record.name==contig:
+            # 24/03: BLAST coordinates are 1-based; normalize once before slicing.
+            left = min(start, end) - 1
+            right = max(start, end)
             if end>start:
-                section = record[start:end]
+                section = record[left:right]
             else:
-                section = record[end-1:start+1].reverse_complement()
+                section = record[left:right].reverse_complement()
                 
             seq = str(section.seq)
     if seq is None:
         raise ValueError(f"Contig '{contig}' not found in {g}")
     return seq
+
+
+def has_internal_stop_codon(nucl_seq):
+    seq_len = len(nucl_seq) - (len(nucl_seq) % 3)
+    if seq_len < 3:
+        return False
+    # 24/03: pseudogene detection must inspect translated CDS, not raw nucleotide sequence.
+    protein = str(Seq(nucl_seq[:seq_len]).translate())
+    return "*" in protein[:-1]
+
+
+def model_path_to_strain(model_path):
+    return Path(model_path).stem
+
+
 def load_reference_model(path):
     if path.endswith(".json"):
         return cobra.io.load_json_model(path)
@@ -372,7 +440,7 @@ def main():
     files = glob("%s/*.gbk" % target_genome_dir) + glob("%s/*.gbff" % target_genome_dir)
     strain_info = []
     for file in files:
-        handle = open(file)
+        handle = open_patched_genbank_handle(file)  # PATCH: normalize wrapped LOCUS headers
         record = list(SeqIO.parse(handle, "genbank"))
         for i in record:
             for f in i.features:
@@ -506,7 +574,7 @@ def main():
             start = data.loc[i, "subjectStart"]
             end = data.loc[i, "subjectEnd"]
             seq = extract_seq(join(target_genome_dir, "%s.fna" % c), contig, start, end)
-            if "*" in seq:
+            if has_internal_stop_codon(seq):
                 print(seq)
                 pseudogenes[c][gene] = seq
                 unannotated.discard(gene)
@@ -553,9 +621,10 @@ def main():
     missing_mappings = []
     for mod in models:
         model = cobra.io.load_json_model(mod)
-        for column in geneIDs_matrix.columns:
-            if column in mod:
-                currentStrain = column
+        # 24/03: match model files to strain columns by exact basename, not substring search.
+        currentStrain = model_path_to_strain(mod)
+        if currentStrain not in geneIDs_matrix.columns:
+            raise KeyError(f"Could not match model file to strain column: {mod}")
     
         IDMapping = geneIDs_matrix[currentStrain].to_dict()
         for k, v in IDMapping.items():
@@ -577,7 +646,8 @@ def main():
     models = glob("%s/*.json" % initial_models_dir)
     for i in range(len(models)):
         model = cobra.io.load_json_model(models[i])
-        strain = models[i].replace(initial_models_dir + "/", "")
+        # 24/03: strip the extension before assigning ids so outputs do not become *.json.json.
+        strain = model_path_to_strain(models[i])
         ort = []
         for ge in model.genes:
             if "ortholog" in str(ge):
@@ -586,7 +656,7 @@ def main():
         remove_genes(modelCopy, ort, remove_reactions=True)
         modelCopy.id = str(strain)
         cobra.io.json.save_json_model(modelCopy, str(join(output_models_dir, strain + ".json")), pretty=False)
-        final_counts[strain.replace(".json", "")] = (len(modelCopy.genes), len(modelCopy.reactions))
+        final_counts[strain] = (len(modelCopy.genes), len(modelCopy.reactions))
 
     print(f"\nPangenome reference -> {ref_gene_count} genes, {ref_rxn_count} reactions")
     print("------------------------------------------------")

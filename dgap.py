@@ -12,12 +12,14 @@ Created on Mon Aug 15 09:27:09 2022
 
 
 import argparse
+import json
+import re
+import zipfile
 import cobra
 import pandas as pd
 from cobra.io import load_json_model
 from glob import glob
 from cobra.manipulation.modify import rename_genes
-import matplotlib.pyplot as plt
 from cobra import Model, Reaction, Metabolite
 import multiprocessing as mp
 import numpy as np
@@ -59,103 +61,200 @@ def ensure_dir(path):
     return path
 
 
+BIOMASS2_STOICHIOMETRY = {
+    # Matches the packaged post-gapfilled JSON models in this repository.
+    "CPS_LBR_c": -0.078,
+    "DNA_LBR_c": -0.205,
+    "LIP_LBR_c": -0.106,
+    "LTAtotal_LBR_c": -0.006,
+    "PGlac2_c": -0.009,
+    "PROT_LBR_c": -3.311,
+    "RNA_LBR_c": -0.926,
+    "atp_c": -27.2,
+    "coa_c": -0.002,
+    "h2o_c": -27.2,
+    "nad_c": -0.002,
+    "pydx5p_c": -0.000001,
+    "udcpdp_c": -0.002,
+    "adp_c": 27.2,
+    "h_c": 27.2,
+    "pi_c": 27.2,
+}
+
+
+M9_LOWER_BOUNDS = {
+    "EX_arg_L_e": -2,
+    "EX_cys_L_e": -2,
+    "EX_glu_L_e": -2,
+    "EX_ile_L_e": -2,
+    "EX_leu_L_e": -2,
+    "EX_met_L_e": -2,
+    "EX_tyr_L_e": -2,
+    "EX_phe_L_e": -2,
+    "EX_thr_L_e": -2,
+    "EX_val_L_e": -2,
+    "EX_gly_e": -2,
+    "EX_ala_L_e": -2,
+    "EX_asp_L_e": -2,
+    "EX_his_L_e": -2,
+    "EX_lys_L_e": -2,
+    "EX_pro_L_e": -2,
+    "EX_ser_L_e": -2,
+    "EX_trp_L_e": -2,
+    "EX_glc_D_e": -15,
+    "EX_ac_e": -1,
+    "EX_cit_e": -1,
+    "EX_thymd_e": -0.1,
+    "EX_ura_e": -1,
+    "EX_gua_e": -1,
+    "EX_ins_e": -1,
+    "EX_ade_e": -1,
+    "EX_xan_e": -1,
+    "EX_orot_e": -1,
+    "EX_btn_e": -0.1,
+    "EX_pnto_R_e": -0.5,
+    "EX_thm_e": -0.1,
+    "EX_pydam_e": -0.1,
+    "EX_pydxn_e": -0.1,
+    "EX_ribflv_e": -0.1,
+    "EX_fol_e": -0.1,
+    "EX_ascb_L_e": -0.5,
+    "EX_4abz_e": -1,
+    "EX_nac_e": -1,
+    "EX_cl_e": -10,
+    "EX_h_e": -1000,
+    "EX_h2o_e": -10,
+    "EX_nh4_e": -10,
+    "EX_ca2_e": -10,
+    "EX_co_e": -10,
+    "EX_co2_e": -10,
+    "EX_pi_e": -100,
+    "EX_cobalt2_e": -10,
+    "EX_cu2_e": -10,
+    "EX_fe3_e": -10,
+    "EX_k_e": -10,
+    "EX_mn2_e": -10,
+    "EX_so4_e": -10,
+    "EX_na1_e": -10,
+    "EX_mg2_e": -10,
+    "EX_zn2_e": -10,
+}
+
+
+def has_id(items, item_id):
+    return hasattr(items, "has_id") and items.has_id(item_id)
+
+
+def clean_model_id(model, model_path=None):
+    model_id = str(model.id or (Path(model_path).stem if model_path else "model"))
+    while model_id.endswith(".json"):
+        model_id = Path(model_id).stem
+    model_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", model_id).strip("._")
+    return model_id or "model"
+
+
+def ensure_biomass2(model, replace=False):
+    if has_id(model.reactions, "BIOMASS2"):
+        reaction = model.reactions.get_by_id("BIOMASS2")
+        if not replace:
+            model.objective = "BIOMASS2"
+            return reaction
+        reaction.subtract_metabolites(reaction.metabolites.copy())
+    else:
+        reaction = Reaction("BIOMASS2")
+        model.add_reactions([reaction])
+
+    missing = [met_id for met_id in BIOMASS2_STOICHIOMETRY if not has_id(model.metabolites, met_id)]
+    if missing:
+        raise KeyError(f"Cannot build BIOMASS2; missing metabolites: {', '.join(missing)}")
+
+    reaction.name = "Biomass production"
+    reaction.subsystem = "Biomass"
+    reaction.lower_bound = 0
+    reaction.upper_bound = 1000
+    reaction.add_metabolites(
+        {
+            model.metabolites.get_by_id(met_id): coefficient
+            for met_id, coefficient in BIOMASS2_STOICHIOMETRY.items()
+        }
+    )
+    reaction.gene_reaction_rule = "BIOMASS"
+    model.objective = "BIOMASS2"
+    model.repair()
+    return reaction
+
+
+def set_growth_objective(model, objective="BIOMASS2", replace_biomass2=False):
+    if objective == "BIOMASS2":
+        ensure_biomass2(model, replace=replace_biomass2)
+    elif has_id(model.reactions, objective):
+        model.objective = objective
+    elif has_id(model.reactions, "BIOMASS2"):
+        model.objective = "BIOMASS2"
+    elif has_id(model.reactions, "BIOMASS"):
+        model.objective = "BIOMASS"
+    else:
+        raise KeyError(f"Model {model.id} has no usable biomass objective.")
+    return model
+
+
+def optimize_growth(model):
+    solution = model.optimize()
+    if solution.status != "optimal" or solution.objective_value is None:
+        return 0.0, solution.status
+    return float(solution.objective_value), solution.status
+
+
+def apply_open_exchanges(model, uptake=-1000, solver=None):
+    if solver:
+        model.solver = solver
+    set_growth_objective(model)
+    for reaction in model.reactions:
+        if reaction.id.startswith("EX_"):
+            reaction.lower_bound = min(reaction.lower_bound, uptake)
+            reaction.upper_bound = max(reaction.upper_bound, 1000)
+    if has_id(model.reactions, "ATPM"):
+        model.reactions.get_by_id("ATPM").lower_bound = 1
+        model.reactions.get_by_id("ATPM").upper_bound = 1
+    return model
+
+
+def gap_reaction_count(model):
+    if has_id(model.genes, "GAP"):
+        return len(model.genes.get_by_id("GAP").reactions)
+    return 0
+
+
 
 
 #formulation of a chemically defined media
-def m9(model, solver=None):
+def m9(model, solver=None, replace_biomass2=False):
     if solver:
         model.solver = solver
+    set_growth_objective(model, "BIOMASS2", replace_biomass2=replace_biomass2)
     for reaction in model.reactions:
-        if 'EX_' in  reaction.id:
-            reaction.lower_bound=0
+        if reaction.id.startswith("EX_"):
+            reaction.lower_bound = 0
 
-    #amino acids
-    model.reactions.EX_arg_L_e.lower_bound = -2
-    model.reactions.EX_cys_L_e.lower_bound = -2
-    model.reactions.EX_glu_L_e.lower_bound = -2
-    model.reactions.EX_ile_L_e.lower_bound = -2
-    model.reactions.EX_leu_L_e.lower_bound = -2
-    model.reactions.EX_met_L_e.lower_bound = -2
-    model.reactions.EX_tyr_L_e.lower_bound = -2
-    model.reactions.EX_phe_L_e.lower_bound = -2
-    model.reactions.EX_thr_L_e.lower_bound = -2
-    model.reactions.EX_val_L_e.lower_bound = -2
-    model.reactions.EX_gly_e.lower_bound = -2
-    model.reactions.EX_ala_L_e.lower_bound = -2
-    model.reactions.EX_asp_L_e.lower_bound = -2
-    model.reactions.EX_his_L_e.lower_bound = -2
-    model.reactions.EX_lys_L_e.lower_bound = -2
-    model.reactions.EX_pro_L_e.lower_bound = -2
-    model.reactions.EX_ser_L_e.lower_bound = -2
-    model.reactions.EX_trp_L_e.lower_bound = -2
+    for reaction_id, lower_bound in M9_LOWER_BOUNDS.items():
+        if has_id(model.reactions, reaction_id):
+            model.reactions.get_by_id(reaction_id).lower_bound = lower_bound
 
-
-    #carbon
-    model.reactions.EX_glc_D_e.lower_bound = -15
-    #model.reactions.EX_glc_D_e.upper_bound = -5
-    model.reactions.EX_ac_e.lower_bound = -1
-    model.reactions.EX_cit_e.lower_bound = -1
-
-    #nuclotides
-    model.reactions.EX_thymd_e.lower_bound = -0.1
-    model.reactions.EX_ura_e.lower_bound = -1
-    model.reactions.EX_gua_e.lower_bound = -1
-    model.reactions.EX_ins_e.lower_bound = -1
-    model.reactions.EX_ade_e.lower_bound = -1
-    model.reactions.EX_xan_e.lower_bound = -1
-    model.reactions.EX_orot_e.lower_bound = -1
-    
-    #vitamins
-    model.reactions.EX_btn_e.lower_bound = -0.1
-    model.reactions.EX_pnto_R_e.lower_bound = -0.5
-    model.reactions.EX_thm_e.lower_bound = -0.1
-    model.reactions.EX_pydam_e.lower_bound = -0.1
-    model.reactions.EX_pydxn_e.lower_bound = -0.1
-    model.reactions.EX_ribflv_e.lower_bound = -0.1
-    model.reactions.EX_fol_e.lower_bound = -0.1
-    model.reactions.EX_ascb_L_e.lower_bound = -0.5
-    model.reactions.EX_4abz_e.lower_bound = -1
-    model.reactions.EX_nac_e.lower_bound = -1
-    
-    #minerals
-    #model.reactions.EX_o2_e.lower_bound = -10
-    model.reactions.EX_cl_e.lower_bound = -10
-    model.reactions.EX_h_e.lower_bound = -1000
-    model.reactions.EX_h2o_e.lower_bound = -10
-    model.reactions.EX_nh4_e.lower_bound = -10
-    model.reactions.EX_ca2_e.lower_bound = -10
-    model.reactions.EX_co_e.lower_bound = -10
-    model.reactions.EX_co2_e.lower_bound = -10
-    model.reactions.EX_pi_e.lower_bound = -100
-    model.reactions.EX_cobalt2_e.lower_bound = -10
-    model.reactions.EX_cu2_e.lower_bound = -10
-    model.reactions.EX_fe3_e.lower_bound = -10
-    model.reactions.EX_k_e.lower_bound = -10
-    model.reactions.EX_mn2_e.lower_bound = -10
-    model.reactions.EX_so4_e.lower_bound = -10
-    model.reactions.EX_na1_e.lower_bound = -10
-    model.reactions.EX_mg2_e.lower_bound = -10
-    model.reactions.EX_zn2_e.lower_bound = -10
-   
-    #correction bounds HCLTr
     for reaction in model.reactions:
-        if 'HCLTr' in  reaction.id:
-            reaction.lower_bound=-10
-            reaction.upper_bound=10
-        if 'PTRCt2' in  reaction.id:
-            reaction.lower_bound=-10
-    #model.reactions.MNLpts.lower_bound = -1
-    model.reactions.ATPM.upper_bound = 1
-    model.reactions.ATPM.lower_bound = 1 #0.38
-    model.reactions.ATPM.upper_bound = 1 #0.38
-    model.reactions.EX_ptrc_e.upper_bound = 0
-    model.reactions.EX_ptrc_e.lower_bound = 0
-    #model.reactions.PTRCORNt7.bounds=(-10,10)
-    
-    
-    #model.reactions.BIOMASS2.upper_bound = 1000
-    #model.reactions.BIOMASS2.lower_bound = 0
-    model.objective = 'BIOMASS2'
+        if "HCLTr" in reaction.id:
+            reaction.lower_bound = -10
+            reaction.upper_bound = 10
+        if "PTRCt2" in reaction.id:
+            reaction.lower_bound = -10
+
+    if has_id(model.reactions, "ATPM"):
+        model.reactions.get_by_id("ATPM").lower_bound = 1
+        model.reactions.get_by_id("ATPM").upper_bound = 1
+    if has_id(model.reactions, "EX_ptrc_e"):
+        model.reactions.get_by_id("EX_ptrc_e").lower_bound = 0
+        model.reactions.get_by_id("EX_ptrc_e").upper_bound = 0
+
+    model.objective = "BIOMASS2"
     return model
     
 
@@ -164,6 +263,7 @@ def m9(model, solver=None):
 def scan(directory, solver=None, growth_threshold=0.01):
     models =glob('%s/*.json'%directory)
     gr=[]
+    status=[]
     mid=[]
     reactions_total = []
     reactions_gap = []
@@ -172,18 +272,20 @@ def scan(directory, solver=None, growth_threshold=0.01):
     for mod in models:
         model=load_json_model(mod)
         m9(model, solver=solver)
-        fba=model.optimize()
-        if fba.fluxes.BIOMASS2 >= growth_threshold:
+        growth, solution_status = optimize_growth(model)
+        if growth >= growth_threshold:
             temps.append(model.id)
         else:
             failed.append(model.id)
-        gr.append(fba.fluxes.BIOMASS2)
+        gr.append(growth)
+        status.append(solution_status)
         mid.append(model.id)
-        reactions_gap.append(len(model.genes.GAP.reactions))
+        reactions_gap.append(gap_reaction_count(model))
         reactions_total.append(len(model.reactions))
     all_gems = pd.DataFrame()
     all_gems['id']=mid
     all_gems['growth']=gr
+    all_gems['status']=status
     all_gems['total_reactions']=reactions_total
     all_gems['gapfilled_reactions']=reactions_gap
     return all_gems,failed,temps
@@ -680,62 +782,13 @@ def coreflux(mod):
     
         
         
-def biomass2(model):
-    model = load_json_model(model)
-    reaction = Reaction('BIOMASS2')
-    reaction.name = 'Biomass production'
-    reaction.subsystem = 'Biomass'
-    reaction.lower_bound = 0.  # This is the default
-    reaction.upper_bound = 1000.  # This is the default
-
-    #metabolites
-    thmpp_c = model.metabolites.get_by_id('thmpp_c')
-    CPS_LBR_c = model.metabolites.get_by_id('CPS_LBR_c')
-    DNA_LBR_c = model.metabolites.get_by_id('DNA_LBR_c')
-    LIP_LBR_c = model.metabolites.get_by_id('LIP_LBR_c')
-    LTAtotal_LBR_c = model.metabolites.get_by_id('LTAtotal_LBR_c')
-    PGlac2_c = model.metabolites.get_by_id('PGlac2_c')
-    PROT_LBR_c = model.metabolites.get_by_id('PROT_LBR_c')
-    RNA_LBR_c = model.metabolites.get_by_id('RNA_LBR_c')
-    atp_c = model.metabolites.get_by_id('atp_c')
-    btn_c = model.metabolites.get_by_id('btn_c')
-    coa_c = model.metabolites.get_by_id('coa_c')
-    h2o_c = model.metabolites.get_by_id('h2o_c')
-    nad_c = model.metabolites.get_by_id('nad_c')
-    pydx5p_c = model.metabolites.get_by_id('pydx5p_c')
-    thf_c = model.metabolites.get_by_id('thf_c')
-    udcpdp_c = model.metabolites.get_by_id('udcpdp_c')
-    adp_c = model.metabolites.get_by_id('adp_c')
-    h_c = model.metabolites.get_by_id('h_c')
-    pi_c = model.metabolites.get_by_id('pi_c')
-    
-    reaction.add_metabolites({
-        thmpp_c: -0.0001,
-        CPS_LBR_c: -0.078,
-        DNA_LBR_c: -0.205,
-        atp_c: -41.2,
-        LIP_LBR_c: -0.106,
-        LTAtotal_LBR_c: -0.006,
-        PGlac2_c: -0.009,
-        PROT_LBR_c: -3.311,
-        RNA_LBR_c: -0.926,
-        btn_c: -0.00001,
-        coa_c: -0.002,
-        h2o_c: -41.2,
-        nad_c: -0.002,
-        pydx5p_c: -0.000001,
-        thf_c: -0.00001,
-        udcpdp_c: -0.002,
-        adp_c: 41.2,
-        h_c: 41.2,
-        pi_c: 41.2
-    })
-    reaction.gene_reaction_rule = '(BIOMASS)'
-    reaction.reaction
-    model.add_reactions([reaction])
-    model.repair()
-    
-    cobra.io.json.save_json_model(model,'/home/omidard/biomassed/'+model.id)        
+def biomass2(model, out_path=None, replace=True):
+    if isinstance(model, (str, Path)):
+        model = load_json_model(str(model))
+    ensure_biomass2(model, replace=replace)
+    if out_path:
+        cobra.io.json.save_json_model(model, str(out_path))
+    return model
         
         
         
@@ -789,110 +842,490 @@ def pro_ess_eff(df):
     return df
 
 
-def pick_template(models_dir, template_path, solver=None, growth_threshold=0.01):
-    scan_df, failed, temps = scan(models_dir, solver=solver, growth_threshold=growth_threshold)
-    if template_path:
-        resolved_template = resolve_model_file(template_path, models_dir)
-        template_id = Path(resolved_template).stem
-        temps_inf = tempfind(scan_df, failed, temps)
-    else:
-        if not temps:
-            raise ValueError("No feasible models found to use as a gapfilling template.")
-        temps_inf = tempfind(scan_df, failed, temps)
-        template_id = temps_inf.iloc[0]["id"]
-        resolved_template = resolve_model_file(template_id, models_dir)
-    return scan_df, failed, temps_inf, template_id, resolved_template
+def resolve_model_inputs(model_refs):
+    if isinstance(model_refs, (str, Path)):
+        model_refs = [model_refs]
+
+    resolved = []
+    for model_ref in model_refs:
+        ref = str(model_ref)
+        path = Path(ref)
+        if path.is_dir():
+            matches = sorted(path.glob("*.json"))
+        elif path.is_file():
+            matches = [path]
+        else:
+            matches = [Path(match) for match in sorted(glob(ref))]
+
+        for match in matches:
+            if match.is_file() and match.suffix == ".json":
+                resolved.append(match)
+
+    unique = []
+    seen = set()
+    for path in resolved:
+        key = str(path.resolve())
+        if key not in seen:
+            unique.append(path)
+            seen.add(key)
+
+    if not unique:
+        raise FileNotFoundError(f"No JSON model files matched: {model_refs}")
+    return unique
 
 
-def run_gapfill_pipeline(models_dir, out_dir, template_path=None, solver=None, threads=None, growth_threshold=0.01):
-    models_dir = str(Path(models_dir))
-    out_dir = str(Path(out_dir))
-    ensure_dir(out_dir)
-    feasible_dir = ensure_dir(os.path.join(out_dir, "feasible"))
-    failed_dir = ensure_dir(os.path.join(out_dir, "failed"))
+def is_gap_gene_rule(gene_reaction_rule):
+    tokens = re.findall(r"[A-Za-z0-9_.-]+", str(gene_reaction_rule))
+    return "GAP" in tokens
 
-    scan_df, failed, temps_inf, template_id, resolved_template = pick_template(
-        models_dir,
-        template_path,
-        solver=solver,
-        growth_threshold=growth_threshold,
-    )
-    scan_df.to_csv(os.path.join(out_dir, "scan_summary.csv"), index=False)
-    temps_inf.to_csv(os.path.join(out_dir, "template_candidates.csv"), index=False)
 
-    if not failed:
-        print("No failed models detected; nothing to gapfill.")
-        return {
-            "scan": scan_df,
-            "failed": failed,
-            "template_candidates": temps_inf,
-            "template_id": template_id,
-            "template_path": resolved_template,
-        }
+def collect_packaged_gap_ids(zip_patterns=None, base_dir="."):
+    zip_patterns = zip_patterns or ["*_json.zip"]
+    base_dir = Path(base_dir)
+    zip_paths = []
+    for pattern in zip_patterns:
+        pattern_path = Path(pattern)
+        if pattern_path.is_absolute():
+            matches = glob(str(pattern_path))
+        else:
+            matches = glob(str(base_dir / pattern))
+        zip_paths.extend(Path(match) for match in sorted(matches))
 
-    allmissing = gaps(failed, template_id, models_dir=models_dir, template_path=resolved_template)
-    xlist, modelsz = zx(allmissing)
+    gap_ids = set()
+    member_count = 0
+    for zip_path in sorted(set(zip_paths)):
+        if not zip_path.is_file():
+            continue
+        with zipfile.ZipFile(zip_path) as archive:
+            for member in archive.namelist():
+                if not member.endswith(".json"):
+                    continue
+                member_count += 1
+                data = json.loads(archive.read(member))
+                for reaction in data.get("reactions", []):
+                    if is_gap_gene_rule(reaction.get("gene_reaction_rule", "")):
+                        gap_ids.add(reaction["id"])
 
-    worker_count = threads or mp.cpu_count()
-    allgapz = []
-    with mp.Pool(worker_count) as pool:
-        for reactions in xlist:
-            allgapz.append(
-                pool.map(
-                    partial(fluxanalyze, template_path=resolved_template, solver=solver, growth_threshold=0.1),
-                    reactions,
-                )
+    return gap_ids, {"zip_count": len(set(zip_paths)), "json_model_count": member_count}
+
+
+def eligible_template_reaction(reaction, include_exchanges=False):
+    if reaction.id in {"BIOMASS", "BIOMASS2"}:
+        return False
+    if not include_exchanges and reaction.id.startswith("EX_"):
+        return False
+    return True
+
+
+def copy_template_reaction_as_gap(template, reaction_id, source):
+    reaction = template.reactions.get_by_id(reaction_id).copy()
+    reaction.gene_reaction_rule = "GAP"
+    reaction.notes = dict(reaction.notes)
+    reaction.notes["gapfill_source"] = source
+    return reaction
+
+
+def add_candidate_reactions(model, template, candidate_ids, source, added_sources):
+    added = []
+    for reaction in template.reactions:
+        reaction_id = reaction.id
+        if reaction_id not in candidate_ids or has_id(model.reactions, reaction_id):
+            continue
+        model.add_reactions([copy_template_reaction_as_gap(template, reaction_id, source)])
+        added_sources[reaction_id] = source
+        added.append(reaction_id)
+    if added:
+        model.repair()
+    return added
+
+
+def prune_added_reactions(model, template, added_sources, growth_threshold):
+    kept = []
+    pruned = []
+    template_order = [reaction.id for reaction in template.reactions if reaction.id in added_sources]
+
+    for reaction_id in template_order:
+        if not has_id(model.reactions, reaction_id):
+            continue
+        reaction = model.reactions.get_by_id(reaction_id)
+        reaction.remove_from_model(remove_orphans=False)
+        model.repair()
+        growth, status = optimize_growth(model)
+        if growth >= growth_threshold:
+            pruned.append(
+                {
+                    "reaction_id": reaction_id,
+                    "reaction_source": added_sources[reaction_id],
+                    "growth_after_removal": growth,
+                    "status_after_removal": status,
+                }
             )
+            continue
 
-    selected_rows = []
-    for model_id, gaps_for_model in zip(modelsz, allgapz):
-        for reaction_id in gaps_for_model:
-            if reaction_id != "no":
-                selected_rows.append({"model_id": model_id, "reaction_id": reaction_id})
-    pd.DataFrame(selected_rows).to_csv(os.path.join(out_dir, "selected_gap_reactions.csv"), index=False)
+        model.add_reactions(
+            [copy_template_reaction_as_gap(template, reaction_id, added_sources[reaction_id])]
+        )
+        model.repair()
+        kept.append(reaction_id)
 
-    addgaps(
-        allgapz,
-        modelsz,
-        template_id,
-        models_dir=models_dir,
-        feasible_dir=feasible_dir,
-        failed_dir=failed_dir,
-        template_path=resolved_template,
-        solver=solver,
-        growth_threshold=growth_threshold,
+    return kept, pruned
+
+
+def evaluate_model_media(model, solver=None, open_exchange_uptake=-1000):
+    m9_model = model.copy()
+    m9(m9_model, solver=solver)
+    m9_growth, m9_status = optimize_growth(m9_model)
+
+    open_model = model.copy()
+    apply_open_exchanges(open_model, uptake=open_exchange_uptake, solver=solver)
+    open_growth, open_status = optimize_growth(open_model)
+
+    return m9_growth, m9_status, open_growth, open_status
+
+
+def complete_single_model(
+    model_path,
+    template,
+    package_gap_ids,
+    out_model_path,
+    candidate_mode="auto",
+    prune=True,
+    solver=None,
+    growth_threshold=0.01,
+    open_exchange_uptake=-1000,
+    include_exchanges=False,
+):
+    model = load_json_model(str(model_path))
+    had_biomass = has_id(model.reactions, "BIOMASS")
+    had_biomass2 = has_id(model.reactions, "BIOMASS2")
+    original_reactions = len(model.reactions)
+    original_gap_reactions = gap_reaction_count(model)
+    model.id = clean_model_id(model, model_path)
+
+    m9(model, solver=solver, replace_biomass2=True)
+    initial_m9_growth, initial_m9_status = optimize_growth(model)
+    _, _, initial_open_growth, initial_open_status = evaluate_model_media(
+        model, solver=solver, open_exchange_uptake=open_exchange_uptake
     )
+
+    template_ids = {
+        reaction.id
+        for reaction in template.reactions
+        if eligible_template_reaction(reaction, include_exchanges=include_exchanges)
+    }
+    package_candidates = {
+        reaction_id
+        for reaction_id in package_gap_ids
+        if reaction_id in template_ids and not has_id(model.reactions, reaction_id)
+    }
+
+    candidate_rows = []
+    selected_rows = []
+    pruned_rows = []
+    added_sources = {}
+
+    growth = initial_m9_growth
+    package_added = []
+    reference_added = []
+    used_reference_fallback = False
+
+    if growth < growth_threshold and candidate_mode in {"auto", "packaged-gaps"}:
+        package_added = add_candidate_reactions(
+            model, template, package_candidates, "packaged_gap", added_sources
+        )
+        candidate_rows.extend(
+            {
+                "reaction_id": reaction_id,
+                "reaction_source": "packaged_gap",
+                "added": True,
+            }
+            for reaction_id in package_added
+        )
+        m9(model, solver=solver)
+        growth, _ = optimize_growth(model)
+
+    if growth < growth_threshold and candidate_mode in {"auto", "reference-missing"}:
+        used_reference_fallback = True
+        reference_candidates = {
+            reaction.id
+            for reaction in template.reactions
+            if reaction.id in template_ids and not has_id(model.reactions, reaction.id)
+        }
+        reference_added = add_candidate_reactions(
+            model, template, reference_candidates, "reference_missing", added_sources
+        )
+        candidate_rows.extend(
+            {
+                "reaction_id": reaction_id,
+                "reaction_source": "reference_missing",
+                "added": True,
+            }
+            for reaction_id in reference_added
+        )
+        m9(model, solver=solver)
+        growth, _ = optimize_growth(model)
+
+    if growth >= growth_threshold and prune and added_sources:
+        kept_ids, pruned_rows = prune_added_reactions(model, template, added_sources, growth_threshold)
+        m9(model, solver=solver)
+        growth, _ = optimize_growth(model)
+    else:
+        kept_ids = [reaction.id for reaction in template.reactions if reaction.id in added_sources]
+
+    selected_rows.extend(
+        {
+            "reaction_id": reaction_id,
+            "reaction_source": added_sources[reaction_id],
+        }
+        for reaction_id in kept_ids
+        if has_id(model.reactions, reaction_id)
+    )
+
+    final_m9_growth, final_m9_status, final_open_growth, final_open_status = evaluate_model_media(
+        model, solver=solver, open_exchange_uptake=open_exchange_uptake
+    )
+    m9(model, solver=solver)
+    cobra.io.json.save_json_model(model, str(out_model_path), pretty=False)
+
+    summary = {
+        "source_path": str(model_path),
+        "model_id": model.id,
+        "output_path": str(out_model_path),
+        "had_biomass": had_biomass,
+        "had_biomass2": had_biomass2,
+        "original_reactions": original_reactions,
+        "original_gap_reactions": original_gap_reactions,
+        "initial_m9_growth": initial_m9_growth,
+        "initial_m9_status": initial_m9_status,
+        "initial_open_growth": initial_open_growth,
+        "initial_open_status": initial_open_status,
+        "package_candidates_added": len(package_added),
+        "reference_candidates_added": len(reference_added),
+        "used_reference_fallback": used_reference_fallback,
+        "pruned_reactions": len(pruned_rows),
+        "selected_gap_reactions": len(selected_rows),
+        "final_reactions": len(model.reactions),
+        "final_gap_reactions": gap_reaction_count(model),
+        "final_m9_growth": final_m9_growth,
+        "final_m9_status": final_m9_status,
+        "final_open_growth": final_open_growth,
+        "final_open_status": final_open_status,
+        "completed": final_m9_growth >= growth_threshold,
+    }
+
+    return summary, candidate_rows, selected_rows, pruned_rows
+
+
+def run_gapfill_pipeline(
+    models,
+    out_dir,
+    template_path="LBReactome.json",
+    gap_zip_globs=None,
+    candidate_mode="auto",
+    prune=True,
+    solver=None,
+    threads=None,
+    growth_threshold=0.01,
+    open_exchange_uptake=-1000,
+    include_exchanges=False,
+):
+    if threads:
+        print("Note: --threads is accepted for compatibility but this completion workflow is serial.")
+
+    model_paths = resolve_model_inputs(models)
+    out_dir = Path(out_dir)
+    ensure_dir(out_dir)
+    completed_dir = Path(ensure_dir(out_dir / "completed_models"))
+    failed_dir = Path(ensure_dir(out_dir / "failed_models"))
+
+    resolved_template = resolve_model_file(template_path)
+    template = load_json_model(resolved_template)
+    m9(template, solver=solver, replace_biomass2=True)
+    template_growth, template_status = optimize_growth(template)
+    if template_growth < growth_threshold:
+        raise ValueError(
+            f"Template {resolved_template} does not grow under m9 "
+            f"(growth={template_growth}, status={template_status})."
+        )
+
+    package_gap_ids, package_stats = collect_packaged_gap_ids(
+        zip_patterns=gap_zip_globs,
+        base_dir=Path.cwd(),
+    )
+    if candidate_mode == "packaged-gaps" and not package_gap_ids:
+        raise ValueError("No packaged GAP reactions found. Use --candidate-mode reference-missing.")
+
+    template_reaction_ids = {reaction.id for reaction in template.reactions}
+    candidate_df = pd.DataFrame(
+        {
+            "reaction_id": sorted(package_gap_ids),
+            "reaction_source": "packaged_gap",
+            "present_in_template": [reaction_id in template_reaction_ids for reaction_id in sorted(package_gap_ids)],
+        }
+    )
+    candidate_df.to_csv(out_dir / "packaged_gap_candidates.csv", index=False)
+
+    summaries = []
+    all_candidates = []
+    all_selected = []
+    all_pruned = []
+    used_output_names = set()
+
+    for model_path in model_paths:
+        preview = load_json_model(str(model_path))
+        model_id = clean_model_id(preview, model_path)
+        output_name = f"{model_id}.json"
+        index = 2
+        while output_name in used_output_names:
+            output_name = f"{model_id}_{index}.json"
+            index += 1
+        used_output_names.add(output_name)
+        out_model_path = completed_dir / output_name
+
+        print(f"Completing {model_path} -> {out_model_path}")
+        summary, candidate_rows, selected_rows, pruned_rows = complete_single_model(
+            model_path=model_path,
+            template=template,
+            package_gap_ids=package_gap_ids,
+            out_model_path=out_model_path,
+            candidate_mode=candidate_mode,
+            prune=prune,
+            solver=solver,
+            growth_threshold=growth_threshold,
+            open_exchange_uptake=open_exchange_uptake,
+            include_exchanges=include_exchanges,
+        )
+
+        if not summary["completed"]:
+            failed_path = failed_dir / output_name
+            Path(summary["output_path"]).replace(failed_path)
+            summary["output_path"] = str(failed_path)
+
+        summaries.append(summary)
+        for row in candidate_rows:
+            row.update({"model_id": summary["model_id"], "source_path": str(model_path)})
+            all_candidates.append(row)
+        for row in selected_rows:
+            row.update({"model_id": summary["model_id"], "source_path": str(model_path)})
+            all_selected.append(row)
+        for row in pruned_rows:
+            row.update({"model_id": summary["model_id"], "source_path": str(model_path)})
+            all_pruned.append(row)
+
+    summary_df = pd.DataFrame(summaries)
+    summary_df.to_csv(out_dir / "completion_summary.csv", index=False)
+    summary_df[
+        [
+            "model_id",
+            "source_path",
+            "output_path",
+            "initial_m9_growth",
+            "initial_open_growth",
+            "final_m9_growth",
+            "final_open_growth",
+            "completed",
+        ]
+    ].to_csv(out_dir / "scan_summary.csv", index=False)
+    pd.DataFrame(all_candidates).to_csv(out_dir / "candidate_gap_reactions.csv", index=False)
+    pd.DataFrame(all_selected).to_csv(out_dir / "selected_gap_reactions.csv", index=False)
+    pd.DataFrame(all_pruned).to_csv(out_dir / "pruned_gap_reactions.csv", index=False)
+    summary_df[
+        [
+            "model_id",
+            "output_path",
+            "final_m9_growth",
+            "final_m9_status",
+            "final_open_growth",
+            "final_open_status",
+            "completed",
+        ]
+    ].to_csv(out_dir / "verification_summary.csv", index=False)
 
     return {
-        "scan": scan_df,
-        "failed": failed,
-        "template_candidates": temps_inf,
-        "template_id": template_id,
+        "summary": summary_df,
         "template_path": resolved_template,
+        "template_growth": template_growth,
+        "package_stats": package_stats,
+        "completed_dir": str(completed_dir),
+        "failed_dir": str(failed_dir),
     }
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Gapfill draft GEMs against a feasible template model.")
-    parser.add_argument("--models", required=True, help="Directory containing input draft GEM JSON files.")
-    parser.add_argument("--out", required=True, help="Output directory for gapfilled results and reports.")
-    parser.add_argument("--template", default=None, help="Optional template model path or id. Defaults to the largest feasible model.")
-    parser.add_argument("--solver", default=None, help="Optional cobra solver name, for example gurobi or glpk.")
-    parser.add_argument("--threads", type=int, default=None, help="Worker processes for reaction screening.")
-    parser.add_argument("--growth-threshold", type=float, default=0.01, help="Minimum BIOMASS2 flux for a model to count as feasible.")
+    parser = argparse.ArgumentParser(
+        description="Complete draft GEM JSON models by adding BIOMASS2 and pruned GAP reactions."
+    )
+    parser.add_argument(
+        "--models",
+        nargs="+",
+        required=True,
+        help="Input JSON files, directories containing JSON models, or glob patterns.",
+    )
+    parser.add_argument("--out", required=True, help="Output directory for completed models and reports.")
+    parser.add_argument(
+        "--template",
+        default="LBReactome.json",
+        help="Reference/template model to copy candidate reactions from.",
+    )
+    parser.add_argument(
+        "--gap-zip-glob",
+        action="append",
+        default=None,
+        help="Glob for packaged JSON ZIPs used to seed GAP candidates. Defaults to *_json.zip.",
+    )
+    parser.add_argument(
+        "--candidate-mode",
+        choices=["auto", "packaged-gaps", "reference-missing"],
+        default="auto",
+        help="Candidate source strategy. auto tries packaged GAP reactions, then missing template reactions if needed.",
+    )
+    parser.add_argument("--solver", default=None, help="Optional COBRA solver name, for example glpk.")
+    parser.add_argument("--threads", type=int, default=None, help="Accepted for compatibility; workflow is serial.")
+    parser.add_argument(
+        "--growth-threshold",
+        type=float,
+        default=0.01,
+        help="Minimum BIOMASS2 flux for a model to count as completed.",
+    )
+    parser.add_argument(
+        "--open-exchange-uptake",
+        type=float,
+        default=-1000,
+        help="Lower bound applied to exchange reactions for open-exchange verification.",
+    )
+    parser.add_argument("--no-prune", action="store_true", help="Keep all added candidates without pruning.")
+    parser.add_argument(
+        "--include-exchanges",
+        action="store_true",
+        help="Allow exchange reactions to be copied from the template as gapfill candidates.",
+    )
     args = parser.parse_args()
 
     results = run_gapfill_pipeline(
-        models_dir=args.models,
+        models=args.models,
         out_dir=args.out,
         template_path=args.template,
+        gap_zip_globs=args.gap_zip_glob,
+        candidate_mode=args.candidate_mode,
+        prune=not args.no_prune,
         solver=args.solver,
         threads=args.threads,
         growth_threshold=args.growth_threshold,
+        open_exchange_uptake=args.open_exchange_uptake,
+        include_exchanges=args.include_exchanges,
     )
-    print(f"Template model: {results['template_id']}")
+    completed = int(results["summary"]["completed"].sum())
+    total = len(results["summary"])
     print(f"Template path: {results['template_path']}")
-    print(f"Failed models processed: {len(results['failed'])}")
+    print(f"Template m9 growth: {results['template_growth']}")
+    print(
+        "Packaged GAP scan: "
+        f"{results['package_stats']['json_model_count']} JSON models in "
+        f"{results['package_stats']['zip_count']} ZIP files"
+    )
+    print(f"Completed models: {completed}/{total}")
+    print(f"Completed model directory: {results['completed_dir']}")
+    print(f"Reports written to: {Path(args.out)}")
 
 
 if __name__ == "__main__":

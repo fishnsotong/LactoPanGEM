@@ -66,11 +66,29 @@ python GEMgenerator.py \
 
 GEMgenerator.py builds draft strain-specific GEMs from a Reactome reference model plus genome files. It parses GenBank annotations, runs BLAST-based orthology searches, constructs presence/absence matrices, prunes the reference model per strain, renames genes to strain-specific loci, and writes draft JSON models.
 
-dgap.py is the main utility library for gapfilling and most downstream model analysis. It defines the m9() media setup, scans model directories for feasible vs failed models, identifies candidate gapfilled reactions from a template model, tests whether reactions are essential, and also includes many later helper functions for exchange fluxes, essential reactions, carbon-source tests, product-associated reaction knockouts, connectivity, and model cleanup. It is the real “toolbox” file in this repo.
+dgap.py is the maintained utility library and CLI for gapfilling/model completion and most downstream model analysis. The current CLI normalizes draft models to the packaged-model BIOMASS2 reaction, applies the repository M9 medium, copies candidate GAP reactions from LBReactome.json using packaged ZIP GAP reactions as clues, falls back to missing template reactions when needed, prunes nonessential added GAP reactions, and writes completed JSON models plus CSV reports.
 
-run_dgap.py is a hard-coded driver script for one particular gapfilling run. It calls scan, tempfind, gaps, zx, and fluxanalyze from dgap.py, then adds selected reactions from one template model into failed models and splits outputs into feasible/ vs failed2/.
+run_dgap.py is now only a compatibility wrapper around the dgap.py CLI. The old hard-coded /home/omidard driver logic has been removed.
 
-dgap2.py is a variant of dgap.py. It overlaps heavily, but uses different media bounds and a few extra utility functions near the bottom. It looks like an experimental fork rather than a clean successor.
+dgap2.py is deprecated as an experimental fork. Keep it only for historical comparison; use dgap.py for maintained completion runs.
+
+### Gap Filling / Model Completion CLI
+
+Use the met conda environment for COBRApy:
+
+```bash
+/Users/wwzyeo/Tools/miniforge3/envs/met/bin/python dgap.py \
+  --models '*/output_models_dir/*.json' \
+  --template LBReactome.json \
+  --out completed_gapfill
+```
+
+Useful outputs:
+- `completed_gapfill/completed_models/*.json`: completed models with BIOMASS2 and retained GAP reactions.
+- `completed_gapfill/completion_summary.csv`: before/after reaction counts, growth, and pruning counts.
+- `completed_gapfill/selected_gap_reactions.csv`: final GAP reactions added to each model.
+- `completed_gapfill/pruned_gap_reactions.csv`: added reactions removed because growth remained feasible without them.
+- `completed_gapfill/verification_summary.csv`: final BIOMASS2 growth under M9 and with all exchanges opened.
 
 ### Downstream Analysis Scripts
 

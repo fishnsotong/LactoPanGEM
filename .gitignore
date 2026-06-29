@@ -4,10 +4,12 @@
 # Python
 __pycache__/
 *.py[cod]
+.matplotlib-cache/
 
 # Local/generated inputs and outputs
 reactome_genes/
 casei_atcc334/
+analysis_results/
 *_dir/
 temp_files/
 initial_models_dir/
@@ -16,6 +18,8 @@ present_absence_dir/
 bbh_dir/
 nucls_dir/
 prots_dir/
+completed_gapfill/
+notebooks/
 
 # Generated strain work directories
 Onc_A1/

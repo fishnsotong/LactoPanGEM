@@ -10,6 +10,9 @@ Created on Mon Aug 15 09:27:09 2022
 
 #imports
 
+# Deprecated experimental fork. Use dgap.py for maintained biomass
+# normalization, completion, pruning, reports, and CLI execution.
+
 
 import cobra
 import pandas as pd
@@ -924,7 +927,6 @@ def calculate_robustness_scores(model_path):
         
     
     
-
 
 
 
